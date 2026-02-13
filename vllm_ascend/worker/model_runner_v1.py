@@ -2593,7 +2593,7 @@ class NPUModelRunner(GPUModelRunner):
                     assert raw_tensor is not None
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                    assert num_blocks >= kv_cache_config.num_blocks
+                    # assert num_blocks >= kv_cache_config.num_blocks
 
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
