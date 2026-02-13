@@ -434,6 +434,16 @@ class NPUPlatform(Platform):
         ):
             speculative_config.enforce_eager = False
 
+        if bool(int(os.environ.get("USE_MULTI_BLOCK_POOL", "0"))):
+            from vllm_ascend.core.linear_scheduler import LinearSchedulerConfig
+            linear_scheduler_config = LinearSchedulerConfig.initialize_from_config(
+                vllm_config)
+            vllm_config.scheduler_config = linear_scheduler_config
+
+            # linear attn does not prefix_caching now
+            vllm_config.scheduler_config.enable_chunked_prefill = True
+
+
     @classmethod
     def import_kernels(cls) -> None:
         # Directly importing vllm_ascend_C prevents ASCEND_RT_VISIBLE_DEVICES

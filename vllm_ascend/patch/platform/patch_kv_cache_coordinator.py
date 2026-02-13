@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Sequence
 
 import vllm
 from vllm.v1.core.kv_cache_coordinator import (HybridKVCacheCoordinator,
@@ -9,7 +10,7 @@ from vllm.v1.core.kv_cache_coordinator import (HybridKVCacheCoordinator,
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import \
-    get_manager_for_kv_cache_spec
+    get_manager_for_kv_cache_spec, CrossAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from vllm_ascend.core.multi_block_pool import MultiBlockPool
@@ -50,10 +51,14 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
-        cache_num_blocks = []
-        for group in kv_cache_config.kv_cache_groups:
+        self.num_speculative_blocks = 0
+        self.linear_group_indicies = []
+        self.request_use_blocks = set()
+        self.cache_num_blocks = []
+        for i, group in enumerate(kv_cache_config.kv_cache_groups):
             if isinstance(group, MambaSpec):
-                linear_tensor_size = set()
+                self.num_speculative_blocks = group.kv_cache_spec.num_speculative_blocks
+                self.linear_group_indicies.append(i)
                 for tensor in kv_cache_config.kv_cache_tensors:
                     if len(tensor.shared_by) == 1 and \
                     tensor.shared_by[0] in group.layer_names:
@@ -61,11 +66,11 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
                 assert len(linear_tensor_size) == 1, "All tensor of a linear kvcache spec group should have same tensor size."
                 linear_tensor_size = list(linear_tensor_size)[0]
                 num_linear_blocks = linear_tensor_size // group.kv_cache_spec.page_size_bytes
-                cache_num_blocks.append(num_linear_blocks)
+                self.cache_num_blocks.append(num_linear_blocks)
             else:
-                cache_num_blocks.append(kv_cache_config.num_blocks)
+                self.cache_num_blocks.append(kv_cache_config.num_blocks)
         self.block_pool = MultiBlockPool(
-            cache_num_blocks,
+            self.cache_num_blocks,
             enable_caching,
             hash_block_size,
             enable_kv_cache_events,
@@ -83,6 +88,93 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
                 self.kv_cache_config.kv_cache_groups))
         self.num_single_type_manager = len(self.single_type_managers)
 
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        """
+        Get the number of blocks needed to be allocated for the request.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: The total number of tokens that need a slot (including
+                tokens that are already allocated).
+            new_computed_blocks: The new computed blocks just hitting the
+                prefix caching.
+            num_encoder_tokens: The number of encoder tokens for allocating
+                blocks for cross-attention.
+            total_computed_tokens: Include both local and external tokens.
+            num_tokens_main_model: The number of tokens for the main model (aka target
+                model in spec decode). w/o spec decode, it is num_tokens;
+                with spec decode, it is num_tokens - num_lookahead_tokens.
+
+        Returns:
+            The number of blocks to allocate.
+        """
+        num_blocks_to_allocate = 0
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                # For cross-attention, we issue a single static allocation
+                # of blocks based on the number of encoder input tokens.
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                    request_id, num_encoder_tokens, [], 0, num_encoder_tokens
+                )
+            else:
+                if i in self.linear_group_indicies and \
+                    len(self.request_use_blocks) * (1 + self.num_speculative_blocks) + 1 >= self.cache_num_blocks[i]:
+                    # if max_num_seqs request is using blocks, 
+                    # aviod allocate new blocks for new request
+                    return 999999999
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_tokens_main_model,
+                )
+        return num_blocks_to_allocate
+
+    def allocate_new_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        num_encoder_tokens: int = 0,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """
+        Allocate new blocks for the request to give it at least `num_tokens`
+        token slots.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: The total number of tokens that need a slot (including
+                tokens that are already allocated).
+            num_tokens_main_model: The number of tokens for the main model (aka target
+                model in spec decode). w/o spec decode, it is num_tokens;
+                with spec decode, it is num_tokens - num_lookahead_tokens.
+            num_encoder_tokens: The number of encoder tokens for allocating
+                blocks for cross-attention.
+
+        Returns:
+            The new allocated blocks.
+        """
+        self.request_use_blocks.add(request_id)
+        return tuple(
+            manager.allocate_new_blocks(
+                request_id,
+                num_encoder_tokens
+                if isinstance(manager, CrossAttentionManager)
+                else num_tokens,
+                num_tokens_main_model,
+            )
+            for manager in self.single_type_managers
+        )
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -91,6 +183,17 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager))
         return blocks, 0
+    
+    def free(self, request_id: str) -> None:
+        """
+        Free the blocks for the request.
+
+        Args:
+            request_id: The request ID.
+        """
+        for manager in self.single_type_managers:
+            manager.free(request_id)
+        self.request_use_blocks.remove(request_id)
 
 
 def get_kv_cache_coordinator(

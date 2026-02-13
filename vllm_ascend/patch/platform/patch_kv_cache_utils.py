@@ -145,7 +145,7 @@ def get_kv_cache_config_from_groups(
         linear_memory_size = 0
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         num_spec_token = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config is not None else 0
-        num_linear_blocks = (max_num_seqs + 1) * (num_spec_token + 1)
+        num_linear_blocks = (max_num_seqs + 1) * 2 * (num_spec_token + 1)
         for kv_cache_group in kv_cache_groups:
             num_layers = len(kv_cache_group.layer_names)
             page_size = kv_cache_group.kv_cache_spec.page_size_bytes
