@@ -22,12 +22,13 @@ import vllm_ascend.patch.platform.patch_sched_yield  # noqa
 from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
-USE_MULTI_BLOCK_POOL = True
+USE_MULTI_BLOCK_POOL = envs.USE_MULTI_BLOCK_POOL
 
 if USE_MULTI_BLOCK_POOL:
     import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
     import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
     import vllm_ascend.patch.platform.patch_vllm_config  # noqa
+    import vllm_ascend.patch.platform.patch_core # noqa
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa

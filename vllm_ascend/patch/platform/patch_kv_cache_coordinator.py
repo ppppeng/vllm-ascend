@@ -14,7 +14,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from vllm_ascend.core.multi_block_pool import MultiBlockPool
 import os
-# 先通过环境变量传入
 from vllm_ascend import envs
 USE_MULTI_BLOCK_POOL = envs.USE_MULTI_BLOCK_POOL
 
@@ -51,10 +50,20 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
-        cache_num_blocks = [
-            USE_MULTI_BLOCK_POOL if isinstance(group, MambaSpec) else kv_cache_config.num_blocks
-            for group in kv_cache_config.kv_cache_groups
-        ]
+        cache_num_blocks = []
+        for group in kv_cache_config.kv_cache_groups:
+            if isinstance(group, MambaSpec):
+                linear_tensor_size = set()
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    if len(tensor.shared_by) == 1 and \
+                    tensor.shared_by[0] in group.layer_names:
+                        linear_tensor_size.add(tensor.size)
+                assert len(linear_tensor_size) == 1, "All tensor of a linear kvcache spec group should have same tensor size."
+                linear_tensor_size = list(linear_tensor_size)[0]
+                num_linear_blocks = linear_tensor_size // group.kv_cache_spec.page_size_bytes
+                cache_num_blocks.append(num_linear_blocks)
+            else:
+                cache_num_blocks.append(kv_cache_config.num_blocks)
         self.block_pool = MultiBlockPool(
             cache_num_blocks,
             enable_caching,
@@ -66,6 +75,7 @@ class KVCacheCoordinatorWithMultiPool(KVCacheCoordinator):
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 block_pool=self.block_pool,
+                enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
